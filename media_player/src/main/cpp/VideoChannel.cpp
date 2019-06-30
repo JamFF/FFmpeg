@@ -21,9 +21,50 @@ void *synchronize(void *args) {
     return nullptr;
 }
 
-VideoChannel::VideoChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext)
-        : BaseChannel(id, javaCallHelper, avCodecContext) {
+/**
+ * 丢弃AVPacket队列中的非关键帧
+ * @param q
+ */
+void dropPacket(queue<AVPacket *> &q) {
+    while (!q.empty()) {
+        AVPacket *pkt = q.front();
+        if (pkt->flags != AV_PKT_FLAG_KEY) {
+            // 压缩数据，存在关键帧，需要过滤，如果丢弃了I帧，会导致B帧、P帧不能解码
+            q.pop();
+            BaseChannel::releaseAvPacket(pkt);
+            LOG_E("dropPacket size = %ld", q.size());
+        } else {
+            // 直到下一个关键帧停止
+            break;
+        }
+    }
+}
 
+/**
+ * 丢弃AVFrame队列数据（YUV数据）
+ * @param q
+ */
+void dropFrame(queue<AVFrame *> &q) {
+    if (!q.empty()) {
+        AVFrame *frame = q.front();
+        // 相比丢弃AVPacket队列，有两个优点
+        // 1. 解码后的YUV数据，不存在关键帧的问题
+        // 2. AVFrame的队列数据直接关联ANativeWindow，如果丢弃AVPacket，AVFrame队列依然是满的，不能快速解决问题
+        q.pop();
+        BaseChannel::releaseAvFrame(frame);
+        LOG_E("dropFrame size = %ld", q.size());
+    }
+}
+
+VideoChannel::VideoChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext,
+                           AVRational time_base)
+        : BaseChannel(id, javaCallHelper, avCodecContext, time_base) {
+
+    frame_queue.setReleaseHandle(releaseAvFrame);// 设置丢帧策略
+    frame_queue.setSyncHandle(dropFrame);// 设置丢帧方法
+
+    pkt_queue.setReleaseHandle(releaseAvPacket);// 设置丢帧策略
+    pkt_queue.setSyncHandle(dropPacket);// 设置丢帧方法
 }
 
 void VideoChannel::start() {
@@ -82,16 +123,83 @@ void VideoChannel::synchronizeFrame() {
         return;
     }
 
-    AVFrame *frame = nullptr;
+    AVFrame *pAVFrame = nullptr;
+
+    // 根据帧率，计算每帧的延迟时间，单位是秒，固定的值
+    double frame_delays = 1 / fps;
+
     while (isPlaying) {
         // 从队列中取出AVFrame，存储的是YUV原始数据
-        ret = frame_queue.deQueue(frame);
+        ret = frame_queue.deQueue(pAVFrame);
         if (!isPlaying) {
             break;
         }
         if (!ret) {
             LOG_E("synchronizeFrame deQueue ret = %d", ret);
             continue;
+        }
+
+        // TODO 有博客说视频使用best_effort_timestamp，目前没有发现不一致的情况
+        /*LOG_D("video best_effort_timestamp = %lld, pts = %lld", pAVFrame->best_effort_timestamp,
+              pAVFrame->pts);*/
+
+        // 解决音视频同步，需要计算音视频时间差diff，调整视频播放，向音频对齐
+        // PTS是播放时间是在编码时确定的，没有考虑解码时间
+        clock = pAVFrame->pts * av_q2d(time_base);// 视频的播放时间
+        double audioClock = pAudioChannel->clock;// 音频的播放时间
+        double diff = clock - audioClock;// 为正，视频超前，为负，音频超前
+
+        // 将解码耗时计算进去，配置差的手机，解码耗时更长
+        // 解码时，extra_delay表示图片必须延迟多少，音频中不需要关注解码时间
+        // 因为音频解码是由OpenSL ES内部循环调用的，并不是我们自己的while循环
+        double extra_delay = pAVFrame->repeat_pict / (2 * fps);// TODO 一直为0，不理解
+        if (ALL_LOG) {
+            LOG_D("repeat_pict = %d, extra_delay = %lf", pAVFrame->repeat_pict, extra_delay);
+        }
+
+        // 真正需要延迟的时间，单位是秒，每帧视频延时时间，再加上解码延迟时间
+        double delay = frame_delays + extra_delay;
+        if (ALL_LOG) {
+            LOG_D("delay = %lf ms", delay * 1000);
+        }
+        if (diff > 0) {// 视频超前
+            // 以delay区分的目的是，避免一次睡眠时间太久，用户感知
+            if (diff < delay) {
+                // 视频超前小于延迟时间，按照标准方式睡眠处理，延迟时间+音视频时间差
+                if (ALL_LOG) {
+                    LOG_D("视频超前 %dms，视频增加延迟", static_cast<int>(diff * 1000));
+                }
+                av_usleep(static_cast<unsigned int>((delay + diff) * 1000000));// 换算微妙
+            } else {
+                // 视频超前大于延迟时间，2倍的延迟时间睡眠处理，更加平滑
+                LOG_D("视频超前 %dms，视频2倍延迟", static_cast<int>(diff * 1000));
+                av_usleep(static_cast<unsigned int>(delay * 2 * 1000000));// 换算微妙
+            }
+        } else if (diff < 0) {// 音频超前
+            if (delay + diff > 0) {
+                // 音频超前小于延迟时间，减少视频延迟
+                if (ALL_LOG) {
+                    LOG_D("音频超前 %dms，视频减少延迟", static_cast<int>(fabs(diff) * 1000));
+                }
+                // av_usleep(static_cast<unsigned int>((delay + diff) * 1000000));// 换算微妙
+            } else {
+                // 音频超前大于延迟时间，即使不延迟，视频播放还是落后音频
+                // 采用不睡眠，并且丢帧的方式，进行追赶
+                LOG_D("音频超前 %dms，视频丢帧", static_cast<int>(fabs(diff) * 1000));
+                releaseAvFrame(pAVFrame);
+                frame_queue.sync();
+                if (fabs(diff) > 0.1) {
+                    // 音频超前大于100ms，AVPacket也需要进行丢帧
+                    pkt_queue.sync();
+                }
+                continue;// 进入下一次循环，不需要发送给ANativeWindow绘制来
+            }
+        } else {
+            if (ALL_LOG) {
+                LOG_D("音视频同步");
+            }
+            // 音视频同步，只处理延迟时间
+            av_usleep(static_cast<unsigned int>(frame_delays * 1000000));
         }
 
         /**
@@ -102,18 +210,17 @@ void VideoChannel::synchronizeFrame() {
          * 4 输入数据第一列要转码的位置 从0开始
          * 5 输入画面的高度
          */
-        sws_scale(sws_ctx, frame->data,
-                  frame->linesize, 0, frame->height,
+        sws_scale(sws_ctx, pAVFrame->data,
+                  pAVFrame->linesize, 0, pAVFrame->height,
                   dst_data, dst_linesize);
 
-        // 回调给 native-lib 去绘制
+        // 回调给native-lib，让ANativeWindow去绘制
         renderFrame(dst_data[0], dst_linesize[0], avCodecContext->width, avCodecContext->height);
-        // FIXME 由于还没做音视频同步，延时16ms
-        av_usleep(16 * 1000);
+
         // 拿到了RGBA数据，就可以释放原始数据
-        releaseAvFrame(frame);
+        releaseAvFrame(pAVFrame);
     }
-    releaseAvFrame(frame);
+    releaseAvFrame(pAVFrame);
     av_freep(&dst_data[0]);
     sws_freeContext(sws_ctx);
     isPlaying = false;
@@ -121,4 +228,8 @@ void VideoChannel::synchronizeFrame() {
 
 void VideoChannel::setRenderCallback(RenderFrame renderFrame) {
     this->renderFrame = renderFrame;
+}
+
+void VideoChannel::setFPS(double fps) {
+    this->fps = fps;
 }

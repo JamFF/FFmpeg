@@ -26,35 +26,40 @@ void bqPlayerCallback(SLAndroidSimpleBufferQueueItf bq, void *context) {
     unsigned int data_len = audioChannel->getPCM();
     if (data_len > 0) {
         // 添加到缓冲队列
-        (*bq)->Enqueue(bq, audioChannel->buffer, data_len);
+        (*bq)->Enqueue(bq, audioChannel->out_buffer, data_len);
     }
 }
 
-AudioChannel::AudioChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext)
-        : BaseChannel(id, javaCallHelper, avCodecContext) {
-    out_sample_rate = 44100;// 采样率
-    // 根据布局获取声道数
-    out_channels = av_get_channel_layout_nb_channels(AV_CH_LAYOUT_STEREO);// 双声道
-    out_sample_size = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);// 16位，2字节
-    // CD音频标准，44100，双声道，16bit
-    buffer = static_cast<uint8_t *>(malloc(out_sample_rate * out_sample_size * out_channels));
+AudioChannel::AudioChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext,
+                           AVRational time_base)
+        : BaseChannel(id, javaCallHelper, avCodecContext, time_base) {
+    // 设置音频输出格式，不管什么样的PCM格式，都重采样为统一的输出格式，CD音频标准，44100，双声道，16bit
+    // 采样率
+    out_sample_rate = 44100;
+    // 根据布局获取声道数，双声道
+    out_channels = av_get_channel_layout_nb_channels(AV_CH_LAYOUT_STEREO);
+    // 16bit，2字节
+    out_sample_size = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+    // 输出缓冲区
+    out_buffer = static_cast<uint8_t *>(malloc(out_sample_rate * out_sample_size * out_channels));
 }
 
 void AudioChannel::start() {
-    swr_ctx = swr_alloc_set_opts(nullptr,
-                                 AV_CH_LAYOUT_STEREO,
-                                 AV_SAMPLE_FMT_S16,
-                                 out_sample_rate,
-                                 avCodecContext->channel_layout,
-                                 avCodecContext->sample_fmt,
-                                 avCodecContext->sample_rate,
+    // 创建重采样上下文，并设置参数
+    swr_ctx = swr_alloc_set_opts(nullptr,// 如果为NULL则创建SwrContext，否则对传入SwrContext进行参数设置
+                                 AV_CH_LAYOUT_STEREO,// 输出的声道格式，AV_CH_LAYOUT_*
+                                 AV_SAMPLE_FMT_S16,// 输出采样位数
+                                 out_sample_rate,// 输出采样率
+                                 avCodecContext->channel_layout,// 输入的声道格式
+                                 avCodecContext->sample_fmt,// 输入采样位数
+                                 avCodecContext->sample_rate,// 输入采样率
                                  0, nullptr);
 
-    swr_init(swr_ctx);// 初始化转换器上下文
+    swr_init(swr_ctx);// 初始化重采样上下文
 
     pkt_queue.setWork(1);
     frame_queue.setWork(1);
-    isPlaying = true;// TODO 播放完成需要设置false
+    isPlaying = true;// TODO 播放完成需要设置false？
     // 开启音频解码线程
     pthread_create(&pid_audio_decode, nullptr, decodeAudio, this);
     // 开启初始化OpenSL ES线程
@@ -62,7 +67,7 @@ void AudioChannel::start() {
 }
 
 void AudioChannel::stop() {
-
+    // TODO av_freep(&out_buffer);注意释放
 }
 
 /**
@@ -166,34 +171,45 @@ void AudioChannel::initOpenSL() {
  * @return
  */
 unsigned int AudioChannel::getPCM() {
-    AVFrame *frame = nullptr;
+    AVFrame *pAVFrame = nullptr;
     int ret;
     int64_t dst_nb_samples;
     unsigned int nb;
     unsigned int data_size = 0;
     if (isPlaying) {
         // 从队列中取出AVFrame，存储的是PCM原始数据
-        ret = frame_queue.deQueue(frame);
+        ret = frame_queue.deQueue(pAVFrame);
         if (!ret) {
             LOG_E("getPCM deQueue ret = %d", ret);
         } else {
             dst_nb_samples = av_rescale_rnd(
-                    swr_get_delay(swr_ctx, frame->sample_rate) + frame->nb_samples,
+                    swr_get_delay(swr_ctx, pAVFrame->sample_rate) + pAVFrame->nb_samples,
                     out_sample_rate,
-                    frame->sample_rate,
+                    pAVFrame->sample_rate,
                     AV_ROUND_UP);
-            // 转换，返回值为转换后的sample个数
+            // 开启重采样，返回每个通道转换后的sample数量，发生错误的时候返回负数
             nb = static_cast<unsigned int>(swr_convert(swr_ctx,// 重采样上下文
-                                                       &buffer,// 输出缓冲区
-                                                       static_cast<int>(dst_nb_samples),// 每个通道采样中可用于输出的空间量
-                                                       (const uint8_t **) frame->data,// 输入缓冲区
-                                                       frame->nb_samples));// 一个通道中可用的输入采样数量
-            // 转换后，数据大小 44110*2*2
-            data_size = nb * out_channels * out_sample_size;
-            // 0.05s
-//        clock = frame->pts * av_q2d(time_base);
+                                                       &out_buffer,// 输出缓冲区
+                                                       static_cast<int>(dst_nb_samples),// 每个通道采样中可用于输出PCM数据的sample数量
+                                                       (const uint8_t **) pAVFrame->data,// 输入缓冲区
+                                                       pAVFrame->nb_samples));// 每个通道可用于输入PCM数据的sample数量
+            if (nb > 0) {
+                // 转换后，数据大小 44110*2*2
+                data_size = nb * out_channels * out_sample_size;
+            } else {
+                LOG_E("swr_convert negative value on error");
+            }
+
+            // 由于视频丢一帧感受不到，但是音频不一样，所以计算音频间隔，在视频播放中与音频进行对齐
+            // pts是以time_base为单位的呈现时间戳（应向用户显示帧的时间）
+            // time_base是表示帧时间戳的基本时间单位（以秒为单位）
+            // 通过这两个参数，可以计算得以秒为单位的呈现时间戳
+            clock = pAVFrame->pts * av_q2d(time_base);
+            // TODO 有博客说音频使用pts，视频使用best_effort_timestamp，目前没有发现不一致的情况
+            /*LOG_D("audio best_effort_timestamp = %lld, pts = %lld", pAVFrame->best_effort_timestamp,
+                  pAVFrame->pts);*/
         }
     }
-    releaseAvFrame(frame);
+    releaseAvFrame(pAVFrame);
     return data_size;
 }

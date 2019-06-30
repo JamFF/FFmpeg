@@ -79,6 +79,7 @@ void MyFFmpeg::prepareFFmpeg() {
     }
 
     for (int i = 0; i < pFormatContext->nb_streams; ++i) {
+
         AVCodecParameters *codecpar = pFormatContext->streams[i]->codecpar;
         // 找到解码器
         AVCodec *dec = avcodec_find_decoder(codecpar->codec_id);
@@ -110,20 +111,34 @@ void MyFFmpeg::prepareFFmpeg() {
             }
             return;
         }
-        if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {// 音频
-            pAudioChannel = new AudioChannel(i, pJavaCallHelper, codecContext);
-        } else if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {// 视频
-            pVideoChannel = new VideoChannel(i, pJavaCallHelper, codecContext);
-            pVideoChannel->setRenderCallback(renderFrame);
+
+        if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            // 音频对应的AVStream
+            AVStream *pStream = pFormatContext->streams[i];
+
+            pAudioChannel = new AudioChannel(i, pJavaCallHelper, codecContext, pStream->time_base);
+        } else if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            // 视频对应的AVStream
+            AVStream *pStream = pFormatContext->streams[i];
+            // 视频帧率，每秒多少帧
+            double fps = av_q2d(pStream->avg_frame_rate);
+            LOG_D("帧率 = %f", fps);
+
+            pVideoChannel = new VideoChannel(i, pJavaCallHelper, codecContext, pStream->time_base);
+            pVideoChannel->setFPS(fps);// 设置帧率，目的是播放视频时，确定延迟时间
+            pVideoChannel->setRenderCallback(renderFrame);// 设置回调
         }
     }
 
-    // 音视频都没有
     if (pAudioChannel == nullptr && pVideoChannel == nullptr) {
+        // 音视频都没有
         if (pJavaCallHelper != nullptr) {
             pJavaCallHelper->onError(THREAD_CHILD, FFMPEG_NOMEDIA);
         }
         return;
+    } else if (pAudioChannel != nullptr && pVideoChannel != nullptr) {
+        // 音视频都存在，需要赋值，进行音视频同步
+        pVideoChannel->pAudioChannel = pAudioChannel;
     }
     if (pJavaCallHelper != nullptr) {
         pJavaCallHelper->onPrepare(THREAD_CHILD);
@@ -133,7 +148,6 @@ void MyFFmpeg::prepareFFmpeg() {
 void MyFFmpeg::start() {
     isPlaying = true;
     if (pAudioChannel != nullptr) {
-        // TODO 音频时需要打开
         pAudioChannel->start();
     }
     if (pVideoChannel != nullptr) {
@@ -150,8 +164,10 @@ void MyFFmpeg::getPacket() {
     while (isPlaying) {
         if ((pAudioChannel != nullptr && pAudioChannel->pkt_queue.size() > QUEUE_MAX)
             || (pVideoChannel != nullptr && pVideoChannel->pkt_queue.size() > QUEUE_MAX)) {
-//            LOG_D("Audio queue size = %d", pAudioChannel->pkt_queue.size());
-//            LOG_D("Video queue size = %d", pVideoChannel->pkt_queue.size());
+            if (ALL_LOG) {
+                LOG_E("Packet queue sleep 10ms, Audio = %d, Video = %d",
+                      pAudioChannel->pkt_queue.size(), pVideoChannel->pkt_queue.size());
+            }
             // 音频或视频Packet队列超过100个，需要减缓生产
             av_usleep(10 * 1000);// 睡眠10ms
             continue;
@@ -165,7 +181,6 @@ void MyFFmpeg::getPacket() {
         if (ret == 0) {
             // 将数据包加入队列
             if (pAudioChannel != nullptr && packet->stream_index == pAudioChannel->channelId) {
-                // TODO 音频时需要打开
                 pAudioChannel->pkt_queue.enQueue(packet);
             } else if (pVideoChannel != nullptr &&
                        packet->stream_index == pVideoChannel->channelId) {
@@ -175,8 +190,8 @@ void MyFFmpeg::getPacket() {
             // 读取完毕 但是不一定播放完毕
             if (pVideoChannel->pkt_queue.empty() && pVideoChannel->frame_queue.empty()
                 && pAudioChannel->pkt_queue.empty() && pAudioChannel->frame_queue.empty()) {
-                LOG_D("播放完毕。。。");
-                // TODO 需要停止队列
+                LOG_D("播放完毕");
+                // TODO 需要停止队列？
                 break;
             }
             // 因为seek的存在，就算读取完毕，依然要循环，去执行av_read_frame(否则seek了没用)

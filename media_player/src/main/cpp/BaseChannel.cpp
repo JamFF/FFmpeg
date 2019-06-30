@@ -4,11 +4,13 @@
 
 #include "BaseChannel.h"
 
-BaseChannel::BaseChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext)
+BaseChannel::BaseChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext,
+                         AVRational time_base)
         : channelId(id),
           javaCallHelper(javaCallHelper),
-          avCodecContext(avCodecContext) {
-    // TODO 参数是一个模版
+          avCodecContext(avCodecContext),
+          time_base(time_base) {
+    // TODO 参数是一个模版，不理解
     pkt_queue.setReleaseHandle(releaseAvPacket);// releaseAvPacket需要声明为静态，不然调用报错
     frame_queue.setReleaseHandle(releaseAvFrame);// releaseAvFrame需要声明为静态，不然调用报错
 }
@@ -96,7 +98,10 @@ void BaseChannel::decodePacket() {
             continue;
         }
         while (frame_queue.size() > QUEUE_MAX && isPlaying) {
-            // 视频Frame队列超过100个，需要减缓生产
+            // 视频或音频Frame队列超过100个，需要减缓生产
+            if (ALL_LOG) {
+                LOG_E("Frame queue sleep 10ms");
+            }
             av_usleep(10 * 1000);// 睡眠10ms
         }
         // 将AVFrame存储到队列，在AudioChannel和VideoChannel中分别解析

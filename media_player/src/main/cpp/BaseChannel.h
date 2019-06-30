@@ -22,7 +22,8 @@ class BaseChannel {
 
 public:
 
-    BaseChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext);
+    BaseChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext,
+                AVRational time_base);
 
     virtual ~BaseChannel();// 父类的析构函数需要定义为虚函数，避免内存泄漏
 
@@ -43,6 +44,9 @@ public:
     volatile bool isPlaying;
     AVCodecContext *avCodecContext;// 析构方法中通过avcodec_free_context释放
     JavaCallHelper *javaCallHelper;// 回调Java的接口
+
+    AVRational time_base;// 时间基，这是表示帧时间戳的基本时间单位（以秒为单位），用于音视频同步
+    double clock = 0;
 };
 
 #endif //FFMPEG_BASECHANNEL_H

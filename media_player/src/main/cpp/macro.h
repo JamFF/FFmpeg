@@ -12,6 +12,8 @@
 #define LOG_D(...) __android_log_print(ANDROID_LOG_DEBUG,LOG_TAG,__VA_ARGS__)
 #define LOG_E(...) __android_log_print(ANDROID_LOG_ERROR,LOG_TAG,__VA_ARGS__)
 
+#define ALL_LOG false
+
 #define DELETE(obj) if(obj){ delete obj; obj = 0; }
 
 // 标记线程 因为子线程需要attach

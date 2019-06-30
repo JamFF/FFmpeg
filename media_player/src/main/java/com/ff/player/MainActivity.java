@@ -27,6 +27,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     private static final int PERMISSION_STORAGE_CODE = 10001;
     private static final String PERMISSION_STORAGE_MSG = "需要SD卡读写权限，否则无法正常使用";
     private static final String[] PERMS = {Manifest.permission.WRITE_EXTERNAL_STORAGE};
+    private static final String FILE_NAME = "input.mp4";
     private SurfaceView mSurfaceView;
     private SeekBar seekBar;
     private int progress;
@@ -49,7 +50,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     private void initData() {
         mPlayer = new MediaPlayer();
         mPlayer.setSurfaceView(mSurfaceView);
-        mFile = new File(Environment.getExternalStorageDirectory(), "input.mp4");
+        mFile = new File(Environment.getExternalStorageDirectory(), FILE_NAME);
     }
 
     private void initEvent() {
