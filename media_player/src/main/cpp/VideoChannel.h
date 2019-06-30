@@ -15,21 +15,18 @@ class VideoChannel : public BaseChannel {
 public:
     VideoChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext);
 
-    void start();
+    void start();// 开启解码和播放线程
 
     void stop();
-
-    void decodePacket();
 
     void synchronizeFrame();
 
     void setRenderCallback(RenderFrame renderFrame);
 
 private:
-    pthread_t pid_video_play;// 解码线程
+    pthread_t pid_video_decode;// 解码线程
     pthread_t pid_synchronize;// 播放线程
     RenderFrame renderFrame;
 };
-
 
 #endif //FFMPEG_VIDEOCHANNEL_H

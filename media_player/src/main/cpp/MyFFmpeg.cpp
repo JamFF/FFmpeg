@@ -133,7 +133,7 @@ void MyFFmpeg::prepareFFmpeg() {
 void MyFFmpeg::start() {
     isPlaying = true;
     if (pAudioChannel != nullptr) {
-        // TODO 没有实现
+        // TODO 音频时需要打开
         pAudioChannel->start();
     }
     if (pVideoChannel != nullptr) {
@@ -150,8 +150,8 @@ void MyFFmpeg::getPacket() {
     while (isPlaying) {
         if ((pAudioChannel != nullptr && pAudioChannel->pkt_queue.size() > QUEUE_MAX)
             || (pVideoChannel != nullptr && pVideoChannel->pkt_queue.size() > QUEUE_MAX)) {
-            LOG_D("Audio queue size = %d", pAudioChannel->pkt_queue.size());
-            LOG_D("Video queue size = %d", pVideoChannel->pkt_queue.size());
+//            LOG_D("Audio queue size = %d", pAudioChannel->pkt_queue.size());
+//            LOG_D("Video queue size = %d", pVideoChannel->pkt_queue.size());
             // 音频或视频Packet队列超过100个，需要减缓生产
             av_usleep(10 * 1000);// 睡眠10ms
             continue;
@@ -165,6 +165,7 @@ void MyFFmpeg::getPacket() {
         if (ret == 0) {
             // 将数据包加入队列
             if (pAudioChannel != nullptr && packet->stream_index == pAudioChannel->channelId) {
+                // TODO 音频时需要打开
                 pAudioChannel->pkt_queue.enQueue(packet);
             } else if (pVideoChannel != nullptr &&
                        packet->stream_index == pVideoChannel->channelId) {

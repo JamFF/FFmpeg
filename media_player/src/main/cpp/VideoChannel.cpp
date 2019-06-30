@@ -9,7 +9,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
-void *decode(void *args) {
+void *decodeVideo(void *args) {
     auto *pVideoChannel = static_cast<VideoChannel *>(args);
     pVideoChannel->decodePacket();
     return nullptr;
@@ -23,9 +23,7 @@ void *synchronize(void *args) {
 
 VideoChannel::VideoChannel(int id, JavaCallHelper *javaCallHelper, AVCodecContext *avCodecContext)
         : BaseChannel(id, javaCallHelper, avCodecContext) {
-    // TODO 父类不能赋值？
-//    this->javaCallHelper = javaCallHelper;
-//    this->avCodecContext = avCodecContext;
+
 }
 
 void VideoChannel::start() {
@@ -33,7 +31,7 @@ void VideoChannel::start() {
     frame_queue.setWork(1);
     isPlaying = true;
     // 开启视频解码线程
-    pthread_create(&pid_video_play, nullptr, decode, this);
+    pthread_create(&pid_video_decode, nullptr, decodeVideo, this);
     // 开启视频播放线程
     pthread_create(&pid_synchronize, nullptr, synchronize, this);
 }
@@ -43,50 +41,7 @@ void VideoChannel::stop() {
 }
 
 /**
- * 解码，运行在子线程
- */
-void VideoChannel::decodePacket() {
-    AVPacket *packet = nullptr;
-    while (isPlaying) {
-        int ret = pkt_queue.deQueue(packet);// 从队列取出AVPacket
-        if (!isPlaying) {
-            break;
-        }
-        if (!ret) {
-            continue;
-        }
-        // 将AVPacket作为输入数据，发送给解码器上下文
-        ret = avcodec_send_packet(avCodecContext, packet);
-        // 数据已经保存到avCodecContext中，释放packet
-        releaseAvPacket(packet);
-        if (ret == AVERROR(EAGAIN)) {
-            // 需要更多数据
-            continue;
-        } else if (ret < 0) {
-            // 失败，例如直播中，推流端停止推流了
-            break;
-        }
-
-        // 因为使用了队列，所以需要这里必须要多次开辟内存空间
-        AVFrame *frame = av_frame_alloc();
-        // 从解码器上下文得到AVFrame作为输出数据
-        ret = avcodec_receive_frame(avCodecContext, frame);
-        if (ret < 0) {
-            continue;
-        }
-        // 将解码后的数据存储到Frame队列，因为此时AVFrame是YUV I420（NV21）格式，需要转码为RGBA8888
-        frame_queue.enQueue(frame);
-        while (frame_queue.size() > QUEUE_MAX && isPlaying) {
-            // 视频Frame队列超过100个，需要减缓生产
-            av_usleep(10 * 1000);// 睡眠10ms
-        }
-    }
-    // 上面已经释放了，这里保险起见
-    releaseAvPacket(packet);
-}
-
-/**
- * 播放，运行在子线程
+ * 封装数据并播放，运行在子线程
  */
 void VideoChannel::synchronizeFrame() {
     // 转码上下文
@@ -129,15 +84,19 @@ void VideoChannel::synchronizeFrame() {
 
     AVFrame *frame = nullptr;
     while (isPlaying) {
+        // 从队列中取出AVFrame，存储的是YUV原始数据
         ret = frame_queue.deQueue(frame);
         if (!isPlaying) {
             break;
         }
         if (!ret) {
+            LOG_E("synchronizeFrame deQueue ret = %d", ret);
             continue;
         }
+
         /**
-         * 将YUV输入数据，转换为输出数据，将信息存储在容器dst_data和dst_linesize中
+         * 将原始数据YUV I420（NV21），转码为RGBA8888
+         * 将播放信息存储在容器dst_data和dst_linesize中
          * 2 6 输入、输出数据
          * 3 7 输入、输出画面一行的数据的大小 AVFrame 转换是一行一行转换的
          * 4 输入数据第一列要转码的位置 从0开始
